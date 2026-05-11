@@ -1,7 +1,7 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
 from collections.abc import Iterable
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -552,6 +552,8 @@ class KimiLinearModel(nn.Module):
             config.num_attention_heads % world_size == 0
         ), "num_attention_heads must be divisible by world_size"
 
+        self.layers_to_capture: List[int] = []
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -578,9 +580,12 @@ class KimiLinearModel(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        # TODO: capture aux hidden states
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
                 layer = self.layers[i]
@@ -638,6 +643,8 @@ class KimiLinearForCausalLM(nn.Module):
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
 
+        self.capture_aux_hidden_states = False
+
     @torch.no_grad()
     def forward(
         self,
@@ -654,12 +661,34 @@ class KimiLinearForCausalLM(nn.Module):
             inputs_embeds,
             pp_proxy_tensors,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i". To capture the hidden state after
+        # target layer `k` (HF-style), we capture before layer `k + 1`.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
