@@ -124,6 +124,67 @@ def _set_kv_buffer_impl(
         v_cache[indices] = v
 
 
+def _set_kv_buffer_prefix_valid_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    store_dtype: torch.dtype,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    row_bytes = row_dim * store_dtype.itemsize
+    if row_bytes <= 0:
+        return
+
+    if row_bytes >= 8192:
+        bytes_per_tile = 512
+        num_warps = 8
+    elif row_bytes >= 4096:
+        bytes_per_tile = 256
+        num_warps = 4
+    else:
+        bytes_per_tile = 128
+        num_warps = 4
+
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_bytes, bytes_per_tile),
+    )
+
+    set_kv_buffer_prefix_valid_tiled[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        int(k.stride(0) * k.element_size()),
+        int(v.stride(0) * v.element_size()),
+        int(k_cache.stride(0) * k_cache.element_size()),
+        int(v_cache.stride(0) * v_cache.element_size()),
+        int(loc_2d.shape[1]),
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -1073,6 +1134,91 @@ class MHATokenToKVPool(KVCache):
             same_kv_dim=self.same_kv_dim,
         )
 
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError(
+                "commit_lens must match loc_2d batch size: "
+                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        num_rows = int(loc_2d.numel())
+        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+            raise ValueError(
+                "dense KV rows must match loc_2d size: "
+                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
+
+        if loc_2d.device != self.k_buffer[0].device:
+            loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
+        if commit_lens.device != self.k_buffer[0].device:
+            commit_lens = commit_lens.to(
+                device=self.k_buffer[0].device, non_blocking=True
+            )
+        if loc_2d.dtype != torch.int64:
+            loc_2d = loc_2d.to(torch.int64)
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+
+        if not (_is_cuda or _is_hip):
+            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                loc_2d.reshape(-1).index_select(0, valid_idx),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id,
+            )
+            return
+
+        _set_kv_buffer_prefix_valid_impl(
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc_2d,
+            commit_lens,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
+        )
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
@@ -1121,6 +1267,116 @@ class MHATokenToKVPool(KVCache):
                 num_warps=cfg["num_warps"],
                 num_stages=2,
             )
+
+
+class NoOpMHATokenToKVPool(MHATokenToKVPool):
+    """KV cache pool that skips physical K/V buffer allocation.
+
+    Used in embedding-mode prefill-only workloads with the FA
+    fa_skip_kv_cache path, where no layer reads or writes KV cache because
+    attention uses raw K/V via flash_attn_varlen_func. Other prefill-only paths
+    such as scoring/MIS may benefit from the same idea later, but some still
+    stage K/V through paged cache today.
+
+    This class keeps the scheduler's view of pool capacity (self.size is
+    honored for admission) but allocates only (page_size, head_num, head_dim)
+    placeholder tensors per layer to satisfy any code paths that dereference
+    the buffers.
+
+    Callers MUST ensure no real set_kv_buffer/get_*_buffer calls happen against
+    this pool; those paths raise loudly so misuse is visible.
+    """
+
+    def _create_buffers(self):
+        # Allocate minimal placeholder buffers. They exist purely so that code
+        # paths holding `k_buffer` / `v_buffer` references (pointer tables,
+        # layer-transfer counters, stride arithmetic) keep working without
+        # None-guards scattered across the codebase. Shape is
+        # [page_size, head_num, head_dim] per layer so that the unconditional
+        # `key_cache.view(-1, page_size, head_num, head_dim)` in the FA backend
+        # at the top of forward_extend succeeds regardless of --page-size.
+        # Total footprint is still on the order of KB vs GBs for a real pool.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        self.mem_usage = 0.0
+        placeholder_bytes = (
+            2
+            * self.layer_num
+            * self.page_size
+            * self.head_num
+            * max(self.head_dim, self.v_head_dim)
+            * self.store_dtype.itemsize
+        )
+        logger.info(
+            f"KV Cache skipped (no-op pool). Logical #tokens: {num_tokens}, "
+            f"physical K/V size: ~{placeholder_bytes / 1024:.1f} KB placeholder"
+        )
+
+    def get_kv_size_bytes(self):
+        # Report zero so downstream memory accounting matches reality.
+        return (0, 0)
+
+    def set_kv_buffer(self, *args, **kwargs):
+        raise RuntimeError(
+            "NoOpMHATokenToKVPool.set_kv_buffer was called. This pool is only "
+            "valid in prefill-only modes (e.g. --is-embedding, scoring) with "
+            "the FA backend's fa_skip_kv_cache path active; the attention "
+            "backend must never write to it. Check that the workload truly "
+            "performs no decode and that the FA backend's fa_skip_kv_cache "
+            "preconditions are met."
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        # Return the placeholder. The FA backend reads this before taking the
+        # fa_skip_kv_cache branch (which does not use it); the placeholder shape
+        # is (page_size, head_num, head_dim) so downstream .view() calls succeed.
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # no-op; embedding mode has no KV cache to move
+        return
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -2092,6 +2348,53 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+@triton.jit
+def set_kv_buffer_prefix_valid_tiled(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_ptr,
+    dst_v_ptr,
+    loc_2d_ptr,
+    commit_len_ptr,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    block_size,
+    ROW_BYTES: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    tid = tl.program_id(2)
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < ROW_BYTES
+    tl.multiple_of(byte_off, 16)
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    src_row = bid * block_size + row
+
+    src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))
+    src_v_ptr = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8))
+    dst_k_ptr = tl.cast(dst_k_ptr, tl.pointer_type(tl.uint8))
+    dst_v_ptr = tl.cast(dst_v_ptr, tl.pointer_type(tl.uint8))
+
+    src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + byte_off
+    src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + byte_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + byte_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + byte_off
+
+    k_val = tl.load(src_k_row_ptr, mask=mask_byte, other=0)
+    v_val = tl.load(src_v_row_ptr, mask=mask_byte, other=0)
+    tl.store(dst_k_row_ptr, k_val, mask=mask_byte)
+    tl.store(dst_v_row_ptr, v_val, mask=mask_byte)
 
 
 @triton.jit
