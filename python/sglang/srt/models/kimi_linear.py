@@ -383,8 +383,17 @@ class KimiDeltaAttention(nn.Module):
 
         # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
         # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
-        # For decode: gate activation is handled inside fused_recurrent kernel.
-        if not forward_batch.forward_mode.is_decode():
+        # For decode AND target_verify: both route to the fused_recurrent
+        # (fused_sigmoid_gating_delta_rule_update) kernel, which applies the
+        # gate activation internally and expects the raw 2D [T, H*K] forget_gate
+        # (its per-token stride is H*K). Treating verify like prefill here
+        # double-sigmoids beta and makes forget_gate 4D (stride[-2] becomes
+        # head_dim instead of H*K), corrupting the verify recurrent state.
+        is_recurrent = (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        if not is_recurrent:
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
@@ -689,6 +698,34 @@ class KimiLinearForCausalLM(nn.Module):
         # SGLang captures "before layer i". To capture the hidden state after
         # target layer `k` (HF-style), we capture before layer `k + 1`.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    # ---- DFlash / EAGLE embed-sharing surface (mirrors qwen3_next.py:1004-1029) ----
+    # spec-v2 dispatcher needs these to share the target embed_tokens + lm_head
+    # weights with the drafter (saves ~2 GB of duplicate embed params on Kimi).
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

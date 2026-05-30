@@ -166,6 +166,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # KDA stores its conv cache as (slots, conv_window, channels), i.e. the
+        # transpose of GDN's (slots, channels, conv_window) layout. See
+        # KimiLinearStateShape.create in configs/mamba_utils.py, which swaps the
+        # tuple to (conv_kernel-1, q_dim + 2*k_dim). HybridLinearAttnBackend's
+        # _init_track_conv_indices reads conv_states_shape[-1] expecting the conv
+        # window length (conv_kernel - 1), so we expose the GDN-oriented
+        # (channels, window) shape here by transposing the raw buffer's last two
+        # dims. This keeps conv_states_shape[-1] == window for the extend
+        # prefix-caching path while the physical KDA buffer stays (window, channels).
+        raw_conv_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
+        # raw_conv_shape == (..., conv_window, channels) -> (..., channels, window)
+        self.conv_states_shape = raw_conv_shape[:-2] + (
+            raw_conv_shape[-1],
+            raw_conv_shape[-2],
+        )
+        rank0_log(
+            f"[KDA] raw conv buffer shape={tuple(raw_conv_shape)}, "
+            f"conv_states_shape (channels, window)={tuple(self.conv_states_shape)}"
+        )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
@@ -236,10 +257,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            conv_states_buffer = mamba_cache_params.conv[0]
+            # KDA stores conv state as (slots, state_len, dim); causal_conv1d_update
+            # expects (slots, dim, state_len). Decode transposes the same way
+            # (forward_decode: conv_states.transpose(-1, -2)); verify must match.
+            conv_states_buffer = mamba_cache_params.conv[0].transpose(-1, -2)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            # Same layout fix as the main conv buffer: KDA stores the window as
+            # (..., state_len, dim) but causal_conv1d_update caches/reads it in
+            # (..., dim, state_len). Transpose so the per-step window cache is
+            # consistent with the transposed main conv_states_buffer above.
             intermediate_conv_window_cache = (
-                mamba_cache_params.intermediate_conv_window[0]
+                mamba_cache_params.intermediate_conv_window[0].transpose(-1, -2)
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
             retrieve_next_token = forward_metadata.retrieve_next_token
