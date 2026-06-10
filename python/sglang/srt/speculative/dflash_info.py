@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -22,6 +23,50 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+
+_DFLASH_BF16_TIE_EPS_ENV = "SGLANG_DFLASH_BF16_TIE_EPS"
+
+
+def _dflash_bf16_tie_eps() -> float:
+    raw = os.environ.get(_DFLASH_BF16_TIE_EPS_ENV)
+    if not raw:
+        return 0.0
+    try:
+        eps = float(raw)
+    except ValueError:
+        return 0.0
+    return eps if eps > 0.0 else 0.0
+
+
+def _compute_dflash_bf16_tie_accept_len_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    bs, draft_token_num = candidates.shape
+    if draft_token_num <= 1:
+        accept_len = torch.zeros((bs,), dtype=torch.int32, device=candidates.device)
+        bonus = target_predict[:, 0]
+        return accept_len, bonus
+
+    logits = next_token_logits.view(bs, draft_token_num, -1)
+    proposed = candidates[:, 1:]
+    exact = proposed == target_predict[:, :-1]
+    top_logits = logits[:, :-1, :].amax(dim=-1)
+    proposed_logits = torch.gather(
+        logits[:, :-1, :], dim=-1, index=proposed.unsqueeze(-1)
+    ).squeeze(-1)
+    near_tie = proposed_logits >= (top_logits - eps)
+    accepted = exact | near_tie
+
+    # DFlash only commits the contiguous prefix of accepted draft tokens.
+    prefix_accepted = accepted.to(torch.int32).cumprod(dim=1)
+    accept_len = prefix_accepted.sum(dim=1).to(torch.int32)
+    bonus = torch.gather(target_predict, dim=1, index=accept_len.unsqueeze(1)).squeeze(1)
+    return accept_len, bonus
 
 
 def _compute_paged_keep_slots(
@@ -377,10 +422,19 @@ class DFlashVerifyInput(SpecInput):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                candidates=candidates,
-                target_predict=target_predict,
-            )
+            tie_eps = _dflash_bf16_tie_eps()
+            if tie_eps > 0.0:
+                accept_len, bonus = _compute_dflash_bf16_tie_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    next_token_logits=logits_output.next_token_logits,
+                    eps=tie_eps,
+                )
+            else:
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(
